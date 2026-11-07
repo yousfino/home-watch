@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from .models import MODELS, verified
+from .detection import RetinaFace
 
 
 @dataclass(frozen=True)
@@ -28,20 +29,17 @@ class Thresholds:
 
 
 class FaceMatcher:
-    def __init__(self, directory: Path, thresholds: Thresholds):
+    def __init__(self, directory: Path, thresholds: Thresholds, confidence=0.7, detector_size=640):
         for name, (_, checksum) in MODELS.items():
             if not verified(directory / name, checksum):
                 raise ValueError("Missing or invalid models. Run: python -m home_watch download-models")
         names = list(MODELS)
-        self.detector = cv2.FaceDetectorYN.create(str(directory / names[0]), "", (320, 320), 0.9)
+        self.detector = RetinaFace(directory / names[0], confidence, detector_size)
         self.recognizer = cv2.FaceRecognizerSF.create(str(directory / names[1]), "")
         self.thresholds = thresholds
 
     def detect(self, image):
-        height, width = image.shape[:2]
-        self.detector.setInputSize((width, height))
-        _, faces = self.detector.detect(image)
-        return [] if faces is None else faces
+        return self.detector.detect(image)
 
     @staticmethod
     def usable(image, face) -> bool:
@@ -58,7 +56,9 @@ class FaceMatcher:
     def enroll(self, image):
         faces = self.detect(image)
         if len(faces) != 1:
-            raise ValueError(f"Reference must contain exactly one face; found {len(faces)}")
+            raise ValueError(f"Reference must contain exactly one face; found {len(faces)}. "
+                             "Run the detect command to inspect boxes and confidence; "
+                             "try --detector-size 1280 for small faces.")
         if not self.usable(image, faces[0]):
             raise ValueError("Reference face is too small, blurry or clipped. Use a clear, well-lit photo.")
         return self.feature(image, faces[0])
@@ -71,5 +71,5 @@ class FaceMatcher:
             if self.usable(image, face):
                 score = float(self.recognizer.match(reference, self.feature(image, face), cv2.FaceRecognizerSF_FR_COSINE))
                 label = self.thresholds.classify(score)
-            results.append({"box": [int(v) for v in face[:4]], "label": label, "similarity": score if score is not None and np.isfinite(score) else None})
+            results.append({"box": [int(v) for v in face[:4]], "label": label, "detection_confidence": float(face[-1]), "similarity": score if score is not None and np.isfinite(score) else None})
         return results
