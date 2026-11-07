@@ -3,14 +3,13 @@ import hashlib
 from pathlib import Path
 import urllib.request
 
-REVISION = "48b10fa505aeb51fbd127fc60a5c660040e823b7"
 MODELS = {
     "retinaface_r34.onnx": (
         "https://github.com/yakhyo/retinaface-pytorch/releases/download/v0.0.1/retinaface_r34.onnx",
         "bd0263dc2a465d32859555cb1741f2d98991eb0053696e8ee33fec583d30e630"),
-    "face_recognition_sface_2021dec.onnx": (
-        f"https://media.githubusercontent.com/media/opencv/opencv_zoo/{REVISION}/models/face_recognition_sface/face_recognition_sface_2021dec.onnx",
-        "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79"),
+    "w600k_r50.onnx": (
+        "https://github.com/yakhyo/uniface/releases/download/weights/w600k_r50.onnx",
+        "4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43"),
 }
 
 def verified(path: Path, checksum: str) -> bool:

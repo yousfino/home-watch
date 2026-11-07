@@ -1,75 +1,64 @@
-"""Face detection, alignment and cosine similarity using CPU inference."""
-from dataclasses import dataclass
+"""RetinaFace detection + ArcFace ResNet-50 embeddings on the CPU."""
 from pathlib import Path
 import cv2
 import numpy as np
+import onnxruntime as ort
 from .models import MODELS, verified
 from .detection import RetinaFace
 
-
-@dataclass(frozen=True)
-class Thresholds:
-    # SFace's example cosine threshold is 0.363. A conservative match band
-    # leaves uncertain scores unresolved; calibrate on representative photos.
-    unfamiliar: float = 0.30
-    familiar: float = 0.45
-
-    def __post_init__(self):
-        if not -1 <= self.unfamiliar < self.familiar <= 1:
-            raise ValueError("Thresholds must satisfy -1 <= unfamiliar < familiar <= 1")
-
-    def classify(self, score: float) -> str:
-        if not np.isfinite(score):
-            return "Unresolved"
-        if score >= self.familiar:
-            return "Familiar"
-        if score <= self.unfamiliar:
-            return "Unfamiliar"
-        return "Unresolved"
+# Standard ArcFace 112x112 alignment template; points are in image-left to
+# image-right order: eyes, nose, mouth corners (matching RetinaFace output).
+TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                     [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
 
 
-class FaceMatcher:
-    def __init__(self, directory: Path, thresholds: Thresholds, confidence=0.7, detector_size=640):
+def align_face(image, landmarks):
+    """Least-squares similarity transform using all five landmarks (Umeyama)."""
+    source = np.asarray(landmarks, dtype=np.float64).reshape(5, 2)
+    target = TEMPLATE.astype(np.float64)
+    if not np.isfinite(source).all():
+        raise ValueError('Nonfinite facial landmarks')
+    src_mean, dst_mean = source.mean(axis=0), target.mean(axis=0)
+    src, dst = source - src_mean, target - dst_mean
+    variance = np.sum(src ** 2) / len(src)
+    if variance < 1e-8:
+        raise ValueError('Degenerate facial landmarks')
+    u, singular, vt = np.linalg.svd(dst.T @ src / len(src))
+    correction = np.eye(2)
+    if np.linalg.det(u @ vt) < 0:
+        correction[-1, -1] = -1
+    rotation = u @ correction @ vt
+    scale = np.sum(singular * np.diag(correction)) / variance
+    matrix = np.column_stack((scale * rotation, dst_mean - scale * rotation @ src_mean))
+    return cv2.warpAffine(image, matrix, (112, 112), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+
+
+class FaceEncoder:
+    def __init__(self, directory: Path, confidence=0.7, detector_size=640):
         for name, (_, checksum) in MODELS.items():
             if not verified(directory / name, checksum):
-                raise ValueError("Missing or invalid models. Run: python -m home_watch download-models")
-        names = list(MODELS)
-        self.detector = RetinaFace(directory / names[0], confidence, detector_size)
-        self.recognizer = cv2.FaceRecognizerSF.create(str(directory / names[1]), "")
-        self.thresholds = thresholds
+                raise ValueError('Missing or invalid pretrained models. Run: python -m home_watch download-models')
+        self.detector = RetinaFace(directory / 'retinaface_r34.onnx', confidence, detector_size)
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 2
+        self.recognizer = ort.InferenceSession(str(directory / 'w600k_r50.onnx'),
+                                               sess_options=options, providers=['CPUExecutionProvider'])
+        self.input_name = self.recognizer.get_inputs()[0].name
 
     def detect(self, image):
         return self.detector.detect(image)
 
-    @staticmethod
-    def usable(image, face) -> bool:
-        x, y, w, h = map(int, face[:4])
-        height, width = image.shape[:2]
-        if min(w, h) < 60 or x < 0 or y < 0 or x + w > width or y + h > height:
-            return False
-        crop = cv2.cvtColor(image[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(crop, cv2.CV_64F).var() >= 40
-
     def feature(self, image, face):
-        return self.recognizer.feature(self.recognizer.alignCrop(image, face)).copy()
+        aligned = align_face(image, face[4:14])
+        tensor = cv2.dnn.blobFromImage(aligned, 1 / 127.5, (112, 112), (127.5, 127.5, 127.5), swapRB=True)
+        return self.recognizer.run(None, {self.input_name: tensor})[0].reshape(-1)
 
-    def enroll(self, image):
+    def single(self, image):
         faces = self.detect(image)
         if len(faces) != 1:
-            raise ValueError(f"Reference must contain exactly one face; found {len(faces)}. "
-                             "Run the detect command to inspect boxes and confidence; "
-                             "try --detector-size 1280 for small faces.")
-        if not self.usable(image, faces[0]):
-            raise ValueError("Reference face is too small, blurry or clipped. Use a clear, well-lit photo.")
+            raise ValueError(f'Expected exactly one face; detected {len(faces)}')
         return self.feature(image, faces[0])
 
-    def compare(self, image, reference):
-        results = []
-        for face in self.detect(image):
-            score = None
-            label = "Unresolved"
-            if self.usable(image, face):
-                score = float(self.recognizer.match(reference, self.feature(image, face), cv2.FaceRecognizerSF_FR_COSINE))
-                label = self.thresholds.classify(score)
-            results.append({"box": [int(v) for v in face[:4]], "label": label, "detection_confidence": float(face[-1]), "similarity": score if score is not None and np.isfinite(score) else None})
-        return results
+    def predict(self, image, profile):
+        return [{**profile.predict(self.feature(image, face)), 'box': face[:4].astype(int).tolist(),
+                 'detection_confidence': float(face[-1])} for face in self.detect(image)]
